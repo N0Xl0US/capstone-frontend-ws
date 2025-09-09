@@ -8,6 +8,10 @@ import { useEffect, useMemo, useRef, useState } from "react"
  */
 
 const INDIA_CENTER = [20.5937, 78.9629]
+const INDIA_BOUNDS = [
+  [6.465, 68.1097],   // SW
+  [35.5133, 97.3956], // NE
+]
 const LEAFLET_CSS_ID = "leaflet-css"
 const LEAFLET_JS_ID = "leaflet-js"
 const LEAFLET_VERSION = "1.9.4"
@@ -26,7 +30,17 @@ export default function RealTimeLeafletMap() {
   const containerRef = useRef(null)
   const mapRef = useRef(null)
   const markersRef = useRef(new Map()) 
+  const animationsRef = useRef(new Map())
+  const pathsRef = useRef(new Map()) // id -> { polyline, coords: L.LatLng[] }
+  const MAX_PATH_POINTS = 500
+  const MIN_SEGMENT_METERS = 5
+  const isZoomingRef = useRef(false)
+  const FOLLOW_PADDING_PX = 100
+  const canvasRendererRef = useRef(null)
   const wsRef = useRef(null)
+  const [selectedTrainId, setSelectedTrainId] = useState(null)
+  const selectedTrainIdRef = useRef(null)
+  useEffect(() => { selectedTrainIdRef.current = selectedTrainId }, [selectedTrainId])
 
   useEffect(() => {
     if (!document.getElementById(LEAFLET_CSS_ID)) {
@@ -72,12 +86,53 @@ export default function RealTimeLeafletMap() {
       const map = L.map(containerRef.current, {
         center,
         zoom: 5,
+        zoomAnimation: false,
+        fadeAnimation: false,
+        preferCanvas: true,
       })
       mapRef.current = map
+
+      // Shared Canvas renderer to keep paths stable during view changes
+      try {
+        canvasRendererRef.current = L.canvas({ padding: 0.5 })
+      } catch {}
 
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
       }).addTo(map)
+
+      // Fit to India on first load
+      try {
+        const bounds = L.latLngBounds(INDIA_BOUNDS)
+        map.fitBounds(bounds, { padding: [20, 20], maxZoom: 6, animate: false })
+      } catch {}
+
+      map.on("zoomstart", () => {
+        isZoomingRef.current = true
+        animationsRef.current.forEach((cancel) => {
+          if (typeof cancel === "function") {
+            try { cancel() } catch {}
+          }
+        })
+        animationsRef.current.clear()
+      })
+
+      map.on("zoomend", () => {
+        isZoomingRef.current = false
+        // If a train is selected, ensure it's centered after zoom
+        try {
+          const selId = selectedTrainIdRef.current
+          if (selId) {
+            const m = markersRef.current.get(selId)
+            if (m) {
+              const target = m.getLatLng()
+              ensureWithinViewport(map, target, FOLLOW_PADDING_PX)
+            }
+          }
+          // Apply a tiny nudge to force reprojection and eliminate residual artifacts
+          nudgeMap(map)
+        } catch {}
+      })
     }
 
     return () => {
@@ -93,6 +148,12 @@ export default function RealTimeLeafletMap() {
         } catch {}
       })
       markersRef.current.clear()
+      pathsRef.current.forEach(({ polyline }) => {
+        try {
+          polyline.remove()
+        } catch {}
+      })
+      pathsRef.current.clear()
     }
   }, [center])
 
@@ -135,12 +196,57 @@ export default function RealTimeLeafletMap() {
 
       const existing = markersRef.current.get(id)
       if (!existing) {
-        const m = L.marker([lat, lng]).addTo(mapRef.current)
+        const m = L.circleMarker([lat, lng], {
+          radius: 5,
+          color: "#16a34a",
+          weight: 2,
+          fill: true,
+          fillColor: "#16a34a",
+          fillOpacity: 1,
+          updateWhenZooming: true,
+          updateWhenDragging: true,
+          renderer: canvasRendererRef.current || undefined,
+        }).addTo(mapRef.current)
+        // Click to select and center
+        try {
+          m.on("click", () => {
+            setSelectedTrainId(id)
+          })
+        } catch {}
         if (popup) m.bindPopup(popup)
         markersRef.current.set(id, m)
-      } else {  
-        animateMarker(existing, [lat, lng])
+        ensurePathInitialized(id, [lat, lng])
+      } else {
+        const cancel = animationsRef.current.get(id)
+        if (typeof cancel === "function") {
+          try { cancel() } catch {}
+        }
+        const current = existing.getLatLng()
+        const dLat = Math.abs(current.lat - lat)
+        const dLng = Math.abs(current.lng - lng)
+        const tinyMove = dLat < 0.00005 && dLng < 0.00005
+        if (tinyMove || isZoomingRef.current) {
+          existing.setLatLng([lat, lng])
+        } else {
+          const cancelNew = animateMarker(existing, [lat, lng])
+          animationsRef.current.set(id, cancelNew)
+        }
         if (popup) existing.bindPopup(popup)
+        appendToPath(id, [lat, lng])
+
+        // If this is the selected train, only pan when it leaves a padded viewport box
+        if (selectedTrainIdRef.current === id && !isZoomingRef.current) {
+          try {
+            const map = mapRef.current
+            if (map) {
+              const target = window.L.latLng(lat, lng)
+              const needsPan = !isPointWithinViewport(map, target, FOLLOW_PADDING_PX)
+              if (needsPan) {
+                map.panTo(target, { animate: true, duration: 0.25, easeLinearity: 0.2, noMoveStart: true })
+              }
+            }
+          } catch {}
+        }
       }
     }
   }
@@ -149,7 +255,10 @@ export default function RealTimeLeafletMap() {
     const L = window.L
     const startLatLng = marker.getLatLng()
     const endLatLng = L.latLng(targetLatLng[0], targetLatLng[1])
-    const duration = 1000
+    const deltaLat = Math.abs(endLatLng.lat - startLatLng.lat)
+    const deltaLng = Math.abs(endLatLng.lng - startLatLng.lng)
+    const distance = Math.sqrt(deltaLat * deltaLat + deltaLng * deltaLng)
+    const duration = Math.min(1000, Math.max(200, distance * 6000))
     const start = performance.now()
 
     let rafId = null
@@ -167,6 +276,123 @@ export default function RealTimeLeafletMap() {
     rafId = requestAnimationFrame(step)
     return () => rafId && cancelAnimationFrame(rafId)
   }
+
+  // Center when a train is selected (clicked or programmatically)
+  useEffect(() => {
+    if (!selectedTrainId || !mapRef.current) return
+    const marker = markersRef.current.get(selectedTrainId)
+    if (!marker) return
+    const target = marker.getLatLng()
+    const map = mapRef.current
+    const desiredZoom = Math.max(map.getZoom(), 7)
+    try {
+      map.setView(target, desiredZoom, { animate: false })
+    } catch {}
+  }, [selectedTrainId])
+
+  // Expose a simple programmatic API for selecting a train by id
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    window.selectTrain = (id) => setSelectedTrainId(id)
+    return () => { try { delete window.selectTrain } catch {} }
+  }, [])
+
+  // Press Escape to reset view to India and clear selection
+  useEffect(() => {
+    function resetToIndia() {
+      const map = mapRef.current
+      if (!map || !window.L) return
+      try {
+        const bounds = window.L.latLngBounds(INDIA_BOUNDS)
+        map.fitBounds(bounds, { padding: [20, 20], maxZoom: 6, animate: false })
+        setSelectedTrainId(null)
+      } catch {}
+    }
+    function onKey(e) {
+      const key = e.key || e.code
+      if (key === "Escape" || key === "Esc") {
+        e.preventDefault?.()
+        resetToIndia()
+      }
+    }
+    const node = containerRef.current
+    window.addEventListener("keydown", onKey, true)
+    document.addEventListener("keydown", onKey, true)
+    node?.addEventListener?.("keydown", onKey, true)
+    return () => {
+      window.removeEventListener("keydown", onKey, true)
+      document.removeEventListener("keydown", onKey, true)
+      node?.removeEventListener?.("keydown", onKey, true)
+    }
+  }, [])
+
+  function ensurePathInitialized(id, latLngArray) {
+    const L = window.L
+    if (!mapRef.current) return
+    if (pathsRef.current.has(id)) return
+    const coords = latLngArray.map((p) => L.latLng(p[0], p[1]))
+    const polyline = L.polyline(coords, {
+      color: "#16a34a",
+      weight: 2,
+      opacity: 0.8,
+      updateWhenZooming: true,
+      updateWhenDragging: true,
+      renderer: canvasRendererRef.current || undefined,
+    }).addTo(mapRef.current)
+    pathsRef.current.set(id, { polyline, coords })
+  }
+
+  function appendToPath(id, latLng) {
+    const L = window.L
+    const map = mapRef.current
+    if (!map) return
+    if (!pathsRef.current.has(id)) {
+      ensurePathInitialized(id, [latLng])
+      return
+    }
+    const entry = pathsRef.current.get(id)
+    const nextPoint = L.latLng(latLng[0], latLng[1])
+    const prevPoint = entry.coords[entry.coords.length - 1]
+    const distance = map.distance(prevPoint, nextPoint)
+    if (distance < MIN_SEGMENT_METERS) return
+    entry.coords.push(nextPoint)
+    if (entry.coords.length > MAX_PATH_POINTS) {
+      entry.coords.splice(0, entry.coords.length - MAX_PATH_POINTS)
+      entry.polyline.setLatLngs(entry.coords)
+    } else {
+      // Incremental add to avoid full reprojection each frame
+      try { entry.polyline.addLatLng(nextPoint) } catch { entry.polyline.setLatLngs(entry.coords) }
+    }
+  }
+
+  function isPointWithinViewport(map, latlng, paddingPx) {
+    try {
+      const size = map.getSize()
+      const p = map.latLngToContainerPoint(latlng)
+      const left = paddingPx
+      const top = paddingPx
+      const right = size.x - paddingPx
+      const bottom = size.y - paddingPx
+      return p.x >= left && p.x <= right && p.y >= top && p.y <= bottom
+    } catch {
+      return true
+    }
+  }
+
+  function ensureWithinViewport(map, latlng, paddingPx) {
+    if (!isPointWithinViewport(map, latlng, paddingPx)) {
+      try { map.panTo(latlng, { animate: false }) } catch {}
+    }
+  }
+
+  function nudgeMap(map) {
+    try {
+      map.panBy([1, 1], { animate: false })
+      map.panBy([-1, -1], { animate: false })
+    } catch {}
+  }
+
+  // Using circle markers, no custom icon needed
 
   const statusDotClass = status === "connected" ? "bg-green-500" : "bg-red-500"
 
