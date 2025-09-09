@@ -89,6 +89,13 @@ export default function RealTimeLeafletMap() {
         zoomAnimation: false,
         fadeAnimation: false,
         preferCanvas: true,
+        minZoom: 3,
+        maxZoom: 20,
+        scrollWheelZoom: true,
+        doubleClickZoom: true,
+        zoomSnap: 0.25,
+        wheelDebounceTime: 20,
+        wheelPxPerZoomLevel: 80,
       })
       mapRef.current = map
 
@@ -99,6 +106,7 @@ export default function RealTimeLeafletMap() {
 
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+        maxZoom: 20,
       }).addTo(map)
 
       // Fit to India on first load
@@ -284,7 +292,7 @@ export default function RealTimeLeafletMap() {
     if (!marker) return
     const target = marker.getLatLng()
     const map = mapRef.current
-    const desiredZoom = Math.max(map.getZoom(), 7)
+    const desiredZoom = Math.min(map.getMaxZoom(), Math.max(7, map.getZoom() + 2))
     try {
       map.setView(target, desiredZoom, { animate: false })
     } catch {}
