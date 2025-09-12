@@ -41,6 +41,13 @@ export default function RealTimeLeafletMap() {
   const [selectedTrainId, setSelectedTrainId] = useState(null)
   const selectedTrainIdRef = useRef(null)
   useEffect(() => { selectedTrainIdRef.current = selectedTrainId }, [selectedTrainId])
+  const startPositionsRef = useRef(new Map())
+  const lastSamplesRef = useRef(new Map()) 
+  const speedsRef = useRef(new Map()) 
+  const geocodeCacheRef = useRef(new Map()) 
+  const geocodePendingRef = useRef(new Map()) 
+  const [infoTick, setInfoTick] = useState(0)
+  const [geoTick, setGeoTick] = useState(0)
 
   useEffect(() => {
     if (!document.getElementById(LEAFLET_CSS_ID)) {
@@ -61,7 +68,6 @@ export default function RealTimeLeafletMap() {
       script.defer = true
       script.onload = () => initMap()
       script.onerror = () => {
-        // eslint-disable-next-line no-console
         console.error("Failed to load Leaflet from CDN")
       }
       document.body.appendChild(script)
@@ -99,7 +105,6 @@ export default function RealTimeLeafletMap() {
       })
       mapRef.current = map
 
-      // Shared Canvas renderer to keep paths stable during view changes
       try {
         canvasRendererRef.current = L.canvas({ padding: 0.5 })
       } catch {}
@@ -109,7 +114,6 @@ export default function RealTimeLeafletMap() {
         maxZoom: 20,
       }).addTo(map)
 
-      // Fit to India on first load
       try {
         const bounds = L.latLngBounds(INDIA_BOUNDS)
         map.fitBounds(bounds, { padding: [20, 20], maxZoom: 6, animate: false })
@@ -127,7 +131,7 @@ export default function RealTimeLeafletMap() {
 
       map.on("zoomend", () => {
         isZoomingRef.current = false
-        // If a train is selected, ensure it's centered after zoom
+        // click center event
         try {
           const selId = selectedTrainIdRef.current
           if (selId) {
@@ -137,7 +141,6 @@ export default function RealTimeLeafletMap() {
               ensureWithinViewport(map, target, FOLLOW_PADDING_PX)
             }
           }
-          // Apply a tiny nudge to force reprojection and eliminate residual artifacts
           nudgeMap(map)
         } catch {}
       })
@@ -215,16 +218,39 @@ export default function RealTimeLeafletMap() {
           updateWhenDragging: true,
           renderer: canvasRendererRef.current || undefined,
         }).addTo(mapRef.current)
-        // Click to select and center
         try {
           m.on("click", () => {
             setSelectedTrainId(id)
           })
         } catch {}
-        if (popup) m.bindPopup(popup)
+        if (popup) { try { m.bindPopup(popup) } catch {} }
         markersRef.current.set(id, m)
         ensurePathInitialized(id, [lat, lng])
+        try {
+          if (!startPositionsRef.current.has(id)) {
+            startPositionsRef.current.set(id, L.latLng(lat, lng))
+          }
+        } catch {}
+        try {
+          lastSamplesRef.current.set(id, { lat, lng, t: performance.now() })
+        } catch {}
       } else {
+        try {
+          const now = performance.now()
+          const prev = lastSamplesRef.current.get(id)
+          if (prev && mapRef.current) {
+            const dist = mapRef.current.distance(L.latLng(prev.lat, prev.lng), L.latLng(lat, lng))
+            const dt = Math.max(0.001, (now - prev.t) / 1000)
+            const speedKmh = (dist * 3.6) / dt
+            speedsRef.current.set(id, speedKmh)
+          }
+          lastSamplesRef.current.set(id, { lat, lng, t: performance.now() })
+        } catch {}
+        try {
+          if (!startPositionsRef.current.has(id)) {
+            startPositionsRef.current.set(id, L.latLng(lat, lng))
+          }
+        } catch {}
         const cancel = animationsRef.current.get(id)
         if (typeof cancel === "function") {
           try { cancel() } catch {}
@@ -239,10 +265,10 @@ export default function RealTimeLeafletMap() {
           const cancelNew = animateMarker(existing, [lat, lng])
           animationsRef.current.set(id, cancelNew)
         }
-        if (popup) existing.bindPopup(popup)
+        if (popup) { try { existing.bindPopup(popup) } catch {} }
         appendToPath(id, [lat, lng])
 
-        // If this is the selected train, only pan when it leaves a padded viewport box
+        // click center event
         if (selectedTrainIdRef.current === id && !isZoomingRef.current) {
           try {
             const map = mapRef.current
@@ -252,6 +278,7 @@ export default function RealTimeLeafletMap() {
               if (needsPan) {
                 map.panTo(target, { animate: true, duration: 0.25, easeLinearity: 0.2, noMoveStart: true })
               }
+              setInfoTick((n) => n + 1)
             }
           } catch {}
         }
@@ -285,7 +312,7 @@ export default function RealTimeLeafletMap() {
     return () => rafId && cancelAnimationFrame(rafId)
   }
 
-  // Center when a train is selected (clicked or programmatically)
+  // click center event
   useEffect(() => {
     if (!selectedTrainId || !mapRef.current) return
     const marker = markersRef.current.get(selectedTrainId)
@@ -298,14 +325,14 @@ export default function RealTimeLeafletMap() {
     } catch {}
   }, [selectedTrainId])
 
-  // Expose a simple programmatic API for selecting a train by id
+  // select train by id
   useEffect(() => {
     if (typeof window === "undefined") return
     window.selectTrain = (id) => setSelectedTrainId(id)
     return () => { try { delete window.selectTrain } catch {} }
   }, [])
 
-  // Press Escape to reset view to India and clear selection
+  // Resret view
   useEffect(() => {
     function resetToIndia() {
       const map = mapRef.current
@@ -368,7 +395,6 @@ export default function RealTimeLeafletMap() {
       entry.coords.splice(0, entry.coords.length - MAX_PATH_POINTS)
       entry.polyline.setLatLngs(entry.coords)
     } else {
-      // Incremental add to avoid full reprojection each frame
       try { entry.polyline.addLatLng(nextPoint) } catch { entry.polyline.setLatLngs(entry.coords) }
     }
   }
@@ -400,7 +426,67 @@ export default function RealTimeLeafletMap() {
     } catch {}
   }
 
-  // Using circle markers, no custom icon needed
+  function formatLatLngOrCity(lat, lng, id) {
+    const key = `${lat.toFixed(5)},${lng.toFixed(5)}`
+    const cached = geocodeCacheRef.current.get(key)
+    if (cached) return cached
+    reverseGeocode(lat, lng)
+      .then((place) => {
+        try {
+          const k = `${lat.toFixed(5)},${lng.toFixed(5)}`
+          geocodeCacheRef.current.set(k, place)
+          setGeoTick((n) => n + 1)
+        } catch {}
+      })
+      .catch(() => {})
+    return `${lat.toFixed(5)}, ${lng.toFixed(5)}`
+  }
+
+  async function reverseGeocode(lat, lng) {
+    const key = `${lat.toFixed(5)},${lng.toFixed(5)}`
+    if (geocodeCacheRef.current.has(key)) return geocodeCacheRef.current.get(key)
+    if (geocodePendingRef.current.has(key)) return geocodePendingRef.current.get(key)
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lng)}&zoom=10&addressdetails=1`
+    const p = fetch(url)
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const json = await res.json()
+        const addr = json?.address || {}
+        const city = addr.city || addr.town || addr.village || addr.hamlet || addr.suburb
+        const state = addr.state
+        const country = addr.country_code ? addr.country_code.toUpperCase() : undefined
+        const place = city && state
+          ? `${city}, ${state}`
+          : (json?.display_name?.split(',').slice(0, 2).join(', ').trim() || `${lat.toFixed(5)}, ${lng.toFixed(5)}`)
+        const finalPlace = country ? `${place}, ${country}` : place
+        geocodeCacheRef.current.set(key, finalPlace)
+        geocodePendingRef.current.delete(key)
+        return finalPlace
+      })
+      .catch(() => {
+        geocodePendingRef.current.delete(key)
+        return `${lat.toFixed(5)}, ${lng.toFixed(5)}`
+      })
+    geocodePendingRef.current.set(key, p)
+    return p
+  }
+
+  function getSelectedInfo() {
+    infoTick; geoTick;
+    if (!selectedTrainId) return null
+    const id = selectedTrainId
+    const marker = markersRef.current.get(id)
+    const start = startPositionsRef.current.get(id)
+    const current = marker?.getLatLng()
+    const speed = speedsRef.current.get(id)
+    const speedText = Number.isFinite(speed) ? `${speed.toFixed(1)} km/h` : "—"
+    const startText = start ? formatLatLngOrCity(start.lat, start.lng, id) : "—"
+    const currText = current ? formatLatLngOrCity(current.lat, current.lng, id) : "—"
+    const startRaw = start ? `${start.lat.toFixed(5)}, ${start.lng.toFixed(5)}` : "—"
+    const currRaw = current ? `${current.lat.toFixed(5)}, ${current.lng.toFixed(5)}` : "—"
+    return { id, speedText, startText, currText, startRaw, currRaw }
+  }
+
 
   const statusDotClass = status === "connected" ? "bg-green-500" : "bg-red-500"
 
@@ -418,7 +504,49 @@ export default function RealTimeLeafletMap() {
         </div>
       </div>
 
-      <div ref={containerRef} className="h-[80vh] w-full rounded-md" role="region" aria-label="Real-time train map" />
+      <div className="flex gap-3 items-stretch">
+        <div ref={containerRef} className="h-[80vh] rounded-md flex-1 min-w-0" role="region" aria-label="Real-time train map" />
+
+        <aside className="h-[80vh] w-80 shrink-0 rounded-md border border-gray-700 p-3 overflow-auto bg-black/20">
+          {(() => {
+            const info = getSelectedInfo()
+            if (!info) {
+              return (
+                <div className="text-sm text-gray-400">
+                  Click a train to see details.
+                </div>
+              )
+            }
+            return (
+              <div className="space-y-3 text-sm">
+                <div className="flex items-center justify-between">
+                  <div className="font-semibold">Train {info.id}</div>
+                  <button
+                    className="rounded bg-gray-700 px-2 py-1 text-xs hover:bg-gray-600"
+                    onClick={() => setSelectedTrainId(null)}
+                  >
+                    Clear
+                  </button>
+                </div>
+                <div>
+                  <div className="text-gray-400">Speed</div>
+                  <div>{info.speedText}</div>
+                </div>
+                <div>
+                  <div className="text-gray-400">Start</div>
+                  <div>{info.startText}</div>
+                  <div className="text-xs text-gray-500">{info.startRaw}</div>
+                </div>
+                <div>
+                  <div className="text-gray-400">Current</div>
+                  <div>{info.currText}</div>
+                  <div className="text-xs text-gray-500">{info.currRaw}</div>
+                </div>
+              </div>
+            )
+          })()}
+        </aside>
+      </div>
 
       <p className="mt-2 text-xs text-gray-500">
         Connect a WebSocket server at ws://localhost:8080 to stream train updates.
